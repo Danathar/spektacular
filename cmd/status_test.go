@@ -128,7 +128,7 @@ func TestStatus_SpecInAnEpicReportsTheWholeEpic(t *testing.T) {
 		require.Equal(t, "E", e["name"])
 		require.Equal(t, "draft", e["document_status"])
 		require.Equal(t, map[string]any{
-			"specs_implemented": float64(1), "specs_total": float64(3),
+			"specs_planned": float64(2), "specs_implemented": float64(1), "specs_total": float64(3),
 			"tasks_completed": float64(2), "tasks_total": float64(4),
 		}, e["progress"])
 		require.Nil(t, got["workflow"])
@@ -247,7 +247,7 @@ func TestStatus_PrettyAndJSONCarryTheSameInformation(t *testing.T) {
 	e := got["epic"].(map[string]any)
 	p := e["progress"].(map[string]any)
 	require.Contains(t, pretty, "epic E  (draft)\n")
-	require.Contains(t, pretty, "  1/3 specs implemented, 2/4 tasks\n")
+	require.Contains(t, pretty, "  2/4 tasks · 2/3 specs planned · 1/3 implemented\n")
 	require.Equal(t, float64(1), p["specs_implemented"])
 	require.Equal(t, float64(4), p["tasks_total"])
 
@@ -265,7 +265,7 @@ func TestStatus_PrettyAndJSONCarryTheSameInformation(t *testing.T) {
 	require.Contains(t, lineFor("A"), "1/1 tasks")
 	require.Contains(t, lineFor("B"), "in progress")
 	require.Contains(t, lineFor("B"), "1/3 tasks")
-	require.Contains(t, lineFor("B"), "← requested")
+	require.NotContains(t, pretty, "requested", "the asked-for spec is highlighted, not labelled")
 	require.Contains(t, lineFor("C"), "specified")
 	require.Contains(t, lineFor("C"), "no plan")
 	require.Contains(t, pretty, "depends on: A")
@@ -275,7 +275,8 @@ func TestStatus_PrettyAndJSONCarryTheSameInformation(t *testing.T) {
 	}
 	require.Contains(t, pretty, "[x] Add a reader")
 	require.Contains(t, pretty, "[ ] Add the writer")
-	require.Contains(t, pretty, "human: needs the production signing key")
+	require.Contains(t, pretty, "   human\n")
+	require.Contains(t, pretty, "reason: needs the production signing key")
 	require.NotContains(t, pretty, "Only task", "siblings show one line each")
 }
 
@@ -779,8 +780,8 @@ func TestStatus_EpicReportCarriesTheRunView(t *testing.T) {
 	// The pretty report's epic header carries the same totals.
 	stdout, _, code := runRootCmd(t, "status", "E")
 	require.Equal(t, 0, code, stdout)
-	require.Contains(t, stdout, "planning: 2 done, 0 in progress, 1 ready, 0 blocked")
-	require.Contains(t, stdout, "implementing: 1 done, 0 in progress, 1 ready, 1 blocked")
+	require.Contains(t, stdout, "planning      2 done, 0 in progress, 1 ready, 0 blocked")
+	require.Contains(t, stdout, "implementing  1 done, 0 in progress, 1 ready, 1 blocked")
 	require.Contains(t, stdout, "problem (epic_unplanned): C has no final plan yet")
 }
 
@@ -804,7 +805,7 @@ func TestStatus_SchemaDescribesTheRunView(t *testing.T) {
 
 // Without a name, status reports the workflow in progress and leaves the run
 // view out; naming the epic shows the shared workflow's spec in progress.
-func TestStatus_RunViewOnlyWhenANameIsGiven(t *testing.T) {
+func TestStatus_RunViewWithOrWithoutAName(t *testing.T) {
 	dir := stProject(t)
 	writeInProgressState(t, filepath.Join(dir, ".spektacular"), workflow.State{
 		Kind:        "implement",
@@ -815,10 +816,9 @@ func TestStatus_RunViewOnlyWhenANameIsGiven(t *testing.T) {
 	})
 
 	bare := statusOf(t, "--format", "json")
-	require.NotContains(t, bare["epic"].(map[string]any), "run")
-	for _, s := range bare["specs"].([]any) {
-		require.NotContains(t, s.(map[string]any), "run")
-	}
+	require.Contains(t, bare["epic"].(map[string]any), "run", "bare status reports the current operation's epic run")
+	bareImpl := statusSpecs(t, bare)["B"]["run"].(map[string]any)["implement"].(map[string]any)
+	require.Equal(t, "in_progress", bareImpl["state"])
 
 	named := statusOf(t, "E", "--format", "json")
 	impl := statusSpecs(t, named)["B"]["run"].(map[string]any)["implement"].(map[string]any)

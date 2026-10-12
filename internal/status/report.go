@@ -73,9 +73,12 @@ type EpicStatus struct {
 	Run *EpicRun `json:"run,omitempty"`
 }
 
-// EpicProgress totals an epic: specs implemented of total, and tasks
-// complete of total across every plan with task structure.
+// EpicProgress totals an epic: specs planned and implemented of total, and
+// tasks complete of total across every plan with task structure. A spec
+// counts its tasks only once its plan is written, so the task total grows
+// as the epic is planned.
 type EpicProgress struct {
+	SpecsPlanned     int `json:"specs_planned"`
 	SpecsImplemented int `json:"specs_implemented"`
 	SpecsTotal       int `json:"specs_total"`
 	TasksCompleted   int `json:"tasks_completed"`
@@ -197,7 +200,9 @@ func Build(opts Options, name string) (Report, error) {
 // workflow in progress listed in Workflows. With nothing in progress it
 // is a report holding only a null workflow. A workflow whose artifact has not
 // been written yet, such as a spec workflow before its spec is saved, is a
-// report holding only the workflow block.
+// report holding only the workflow block. When the first workflow was started
+// by an epic orchestrator, the operation is the epic rather than that one
+// spec, so no spec is requested.
 func BuildCurrent(opts Options) (Report, error) {
 	active := activeWorkflows(opts)
 	if len(active) == 0 {
@@ -211,6 +216,9 @@ func BuildCurrent(opts Options) (Report, error) {
 	}
 	if err != nil {
 		return Report{}, err
+	}
+	if primary.Orchestrated && r.Epic != nil {
+		r.Requested = ""
 	}
 	r.Workflow = &primary
 	r.Workflows = active
@@ -408,7 +416,11 @@ func buildTarget(opts Options, target Target) (Report, error) {
 		p := &r.Epic.Progress
 		p.SpecsTotal = len(r.Specs)
 		for _, s := range r.Specs {
-			if s.State == StateImplemented {
+			switch s.State {
+			case StatePlanned, StateInProgress:
+				p.SpecsPlanned++
+			case StateImplemented:
+				p.SpecsPlanned++
 				p.SpecsImplemented++
 			}
 			if s.Plan != nil && s.Plan.Progress != nil {

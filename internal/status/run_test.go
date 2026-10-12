@@ -214,7 +214,7 @@ func TestRun_FinishedButUnmergedIsAwaitingMerge(t *testing.T) {
 
 	var buf bytes.Buffer
 	require.NoError(t, RenderPretty(&buf, r))
-	require.Contains(t, buf.String(), "  implementing: 0 done, 1 in progress, 1 awaiting merge, 0 ready, 0 blocked\n")
+	require.Contains(t, buf.String(), "  implementing  0 done, 1 in progress, 1 awaiting merge, 0 ready, 0 blocked\n")
 }
 
 // Nothing under a worktree's own .spektacular affects the run view: a stray
@@ -521,14 +521,14 @@ func TestRun_PrettyShowsPlanningAndImplementing(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, RenderPretty(&buf, r))
 	out := buf.String()
-	require.Contains(t, out, "\n  planning: 3 done, 0 in progress, 0 ready, 0 blocked\n")
-	require.Contains(t, out, "\n  implementing: 1 done, 0 in progress, 2 ready, 0 blocked\n")
+	require.Contains(t, out, "\n  planning      3 done, 0 in progress, 0 ready, 0 blocked\n")
+	require.Contains(t, out, "\n  implementing  1 done, 0 in progress, 2 ready, 0 blocked\n")
 	require.NotContains(t, out, "problem (")
 
 	// Without the run view, neither line appears.
 	e.opts.Run = nil
 	buf.Reset()
 	require.NoError(t, RenderPretty(&buf, buildRunReport(t, e, "E")))
-	require.NotContains(t, buf.String(), "planning:")
-	require.NotContains(t, buf.String(), "implementing:")
+	require.NotContains(t, buf.String(), "planning ")
+	require.NotContains(t, buf.String(), "implementing ")
 }

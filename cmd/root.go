@@ -93,11 +93,19 @@ func Execute() {
 // session log, for reconstructing a session after the fact. This is
 // strictly additive: with the option off (the default), runRoot's behavior
 // is byte-for-byte identical to what it is without any of this.
+//
+// SPEKTACULAR_SESSION_LOG=off leaves one command out of the session log,
+// for a caller that polls, such as an editor or agent-host mod refreshing
+// status every few seconds, whose calls would otherwise bury the session.
+// sessionLogEnv names the variable that, set to "off", keeps a command out
+// of the debug session log.
+const sessionLogEnv = "SPEKTACULAR_SESSION_LOG"
+
 func runRoot() int {
 	// The debug probe must tolerate running outside a project — the gate
 	// belongs to the command handlers, not here.
 	cfg, cfgErr := loadConfigLenient()
-	debugEnabled := cfgErr == nil && cfg.Debug.Enabled
+	debugEnabled := cfgErr == nil && cfg.Debug.Enabled && os.Getenv(sessionLogEnv) != "off"
 
 	var argv []string
 	var start time.Time

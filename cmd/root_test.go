@@ -676,6 +676,20 @@ func TestSessionLog_DisabledProducesNoRecordFile(t *testing.T) {
 	})
 }
 
+// SPEKTACULAR_SESSION_LOG=off keeps one command out of the session log even
+// with debug on, so a caller that polls status does not bury the session.
+func TestSessionLog_EnvOffLeavesACommandOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeSpecCommandConfig(t, dir, "debug:\n  enabled: true\n")
+	resetRootCmd(t)
+	t.Setenv(sessionLogEnv, "off")
+
+	stdout, _, code := runRootCmd(t, "spec", "new", "--data", `{"name":"billing"}`)
+	require.Equal(t, 0, code, stdout)
+	require.Empty(t, sessionLogFiles(t, dir))
+}
+
 // Phase 1.2, criterion 2: with debug on, a command that succeeds and a
 // command that is rejected (fails validation, returning an
 // *output.ErrorResponse via the standard envelope machinery) each produce a

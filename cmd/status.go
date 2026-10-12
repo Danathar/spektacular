@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/hivecommons/spektacular/internal/autocommit"
 	"github.com/hivecommons/spektacular/internal/config"
@@ -34,10 +33,14 @@ var statusCmd = &cobra.Command{
 a spec in an epic, or its plan, reports the whole epic, with the spec asked for
 named in "requested". With no name, reports every workflow in progress, the
 shared one and each spec's own run, with the first one's epic or spec in full,
-or that nothing is in progress.
+or that nothing is in progress. When an epic orchestrator started that first
+run, the report is the epic's, as if the epic had been named. The readable
+tree expands the spec asked for to its milestones and tasks, or, with no spec
+asked for, every spec being implemented.
 
 --watch keeps the readable tree on screen and refreshes it every --interval
-(2s by default) until interrupted with Ctrl+C.`,
+(2s by default) until q, Esc or Ctrl+C. A tree taller than the screen scrolls
+with the arrow keys, j/k, PgUp/PgDn, g/G and the mouse wheel.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runStatus,
 }
@@ -90,7 +93,7 @@ var statusRunCountsSchema = &schemaProp{Type: "object", Properties: map[string]*
 }}
 
 // statusEpicRunSchema is where an epic stands for planning and implementing.
-var statusEpicRunSchema = &schemaProp{Type: "object", Description: "present when an epic is named", Properties: map[string]*schemaProp{
+var statusEpicRunSchema = &schemaProp{Type: "object", Description: "present when the report has an epic", Properties: map[string]*schemaProp{
 	"order":       {Type: "array", Items: &schemaProp{Type: "string"}, Description: "dependency order; ties follow the epic's list order"},
 	"plan":        statusRunCountsSchema,
 	"implement":   statusRunCountsSchema,
@@ -116,6 +119,7 @@ var statusOutputSchema = &schemaObj{
 			"created_at":      {Type: "string"},
 			"done":            {Type: "boolean"},
 			"progress": {Type: "object", Properties: map[string]*schemaProp{
+				"specs_planned":     {Type: "integer", Description: "specs whose plan is written; only these count towards the task totals"},
 				"specs_implemented": {Type: "integer"},
 				"specs_total":       {Type: "integer"},
 				"tasks_completed":   {Type: "integer"},
@@ -143,7 +147,7 @@ var statusOutputSchema = &schemaObj{
 				}},
 				"tasks": {Type: "array", Items: statusTaskSchema},
 			}},
-			"run": {Type: "object", Description: "what the spec still needs; present when a name is given", Properties: map[string]*schemaProp{
+			"run": {Type: "object", Description: "what the spec still needs", Properties: map[string]*schemaProp{
 				"plan":      statusRunPartSchema,
 				"implement": statusRunPartSchema,
 			}},
@@ -160,7 +164,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			Output: statusOutputSchema,
 			Flags: map[string]*schemaProp{
 				"format":   {Type: "string", Enum: []string{statusFormatPretty, statusFormatJSON}},
-				"watch":    {Type: "boolean", Description: "redraw the readable tree every interval until interrupted; pretty only"},
+				"watch":    {Type: "boolean", Description: "keep the readable tree on screen, scrollable, redrawn every interval until q or Ctrl+C; pretty only"},
 				"interval": {Type: "string", Description: "how often --watch refreshes, as a Go duration such as 2s; at least 200ms"},
 			},
 		}, "")
@@ -212,16 +216,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		if len(args) == 1 {
 			title += " " + args[0]
 		}
-		return watchStatus(ctx, term, interval, func() string {
+		return watchStatus(ctx, term, title, interval, func(width int) string {
 			var b bytes.Buffer
-			b.WriteString(status.WatchHeader(term, title, interval, time.Now()) + "\n\n")
 			r, err := buildStatusReport(cfg, root, dir, args)
 			if err != nil {
-				b.WriteString(status.WatchError(term, toErrorResponse(err).Message) + "\n")
-				return b.String()
+				return status.WatchError(term, toErrorResponse(err).Message) + "\n"
 			}
-			if err := status.RenderPrettyStyled(&b, r, term); err != nil {
-				b.WriteString(status.WatchError(term, err.Error()) + "\n")
+			if err := status.RenderPrettyWith(&b, r, status.PrettyOptions{Term: term, Width: width}); err != nil {
+				return status.WatchError(term, err.Error()) + "\n"
 			}
 			return b.String()
 		})
@@ -255,8 +257,8 @@ func buildStatusReport(cfg config.Config, root, dir string, args []string) (stat
 		},
 		Unmerged: unmergedFn(root),
 	}
+	opts.Run = statusRunSource(cfg, root, opts.Store)
 	if len(args) == 1 {
-		opts.Run = statusRunSource(cfg, root, opts.Store)
 		return status.Build(opts, args[0])
 	}
 	return status.BuildCurrent(opts)
@@ -279,7 +281,7 @@ func outputTerminal(cmd *cobra.Command) io.Writer {
 func init() {
 	statusCmd.Flags().Bool("schema", false, "Print the input/output schema and exit")
 	statusCmd.Flags().String("format", statusFormatPretty, "Output format: pretty or json")
-	statusCmd.Flags().Bool("watch", false, "Keep the readable tree on screen, refreshed every --interval, until interrupted")
+	statusCmd.Flags().Bool("watch", false, "Keep the readable tree on screen, scrollable, refreshed every --interval, until q or Ctrl+C")
 	statusCmd.Flags().Duration("interval", defaultWatchInterval, "How often --watch refreshes")
 }
 

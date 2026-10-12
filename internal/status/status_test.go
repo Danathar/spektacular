@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/hivecommons/spektacular/internal/config"
 	"github.com/hivecommons/spektacular/internal/epic"
 	"github.com/hivecommons/spektacular/internal/metadata"
@@ -242,7 +243,7 @@ func TestBuild_EpicReport(t *testing.T) {
 	require.Equal(t, "draft", r.Epic.DocumentStatus)
 	require.Equal(t, "2026-09-28T00:00:00Z", r.Epic.CreatedAt)
 	require.False(t, r.Epic.Done)
-	require.Equal(t, EpicProgress{SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
+	require.Equal(t, EpicProgress{SpecsPlanned: 2, SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
 
 	names := []string{}
 	for _, s := range r.Specs {
@@ -677,6 +678,27 @@ func TestBuildCurrent_Lanes(t *testing.T) {
 		require.Equal(t, "B", r.Requested)
 	})
 
+	t.Run("an orchestrated run reports its epic with no spec requested", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+		e.opts.State = nil
+		e.opts.Lane = lanes(map[string]*workflow.State{
+			"plan-C": laneSet["plan-C"],
+		})
+		e.opts.LaneNames = func(kind string) []string {
+			if kind == "plan" {
+				return []string{"C"}
+			}
+			return nil
+		}
+
+		r, err := BuildCurrent(e.opts)
+		require.NoError(t, err)
+		require.True(t, r.Workflow.Orchestrated)
+		require.Equal(t, "E", r.Epic.Name)
+		require.Empty(t, r.Requested, "the epic is the operation, not the one spec")
+	})
+
 	t.Run("the shared workflow comes before every lane", func(t *testing.T) {
 		e := newEnv(t)
 		e.standardEpic()
@@ -748,7 +770,7 @@ func TestDependenciesOf_UnmergedDependencyIsUnmet(t *testing.T) {
 	b := specByName(t, r, "B")
 	require.False(t, b.Ready)
 	require.Equal(t, []string{"A"}, b.BlockedBy)
-	require.Equal(t, EpicProgress{SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
+	require.Equal(t, EpicProgress{SpecsPlanned: 2, SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
 }
 
 // The hook only matters for an implemented dependency, and a hook reporting
@@ -810,23 +832,72 @@ func TestRenderPretty_Epic(t *testing.T) {
 	require.NoError(t, RenderPretty(&buf, r))
 	want := strings.Join([]string{
 		"epic E  (draft)",
-		"  ━━━━━━━━━━━━────────  1/4 specs implemented, 3/5 tasks",
+		"  ━━━━━━━━━━━━────────  3/5 tasks · 2/4 specs planned · 1/4 implemented",
 		"",
-		"  ✓ A   implemented   2/2 tasks",
-		"  ◐ B   in progress   1/3 tasks   ← requested",
+		"  ✓ A   implemented   ━━━━━━━━━━   2/2 tasks",
+		"  ◐ B   in progress   ━━━───────   1/3 tasks",
 		"      depends on: A",
-		"      Milestone 1",
+		"      Milestone 1  1/3",
 		"        [x] Task 1   spektacular   agent",
 		"        [ ] Task 2   spektacular   agent",
 		"            depends on: Task 1",
 		"        [ ] Task 3   spektacular   agent",
 		"            depends on: Task 2",
-		"  · C   specified     no plan",
+		"  · C   specified                  no plan",
 		"      depends on: B",
-		"  ✗ D   missing       no plan",
+		"  ✗ D   missing                    no plan",
 		"",
 	}, "\n")
 	require.Equal(t, want, buf.String())
+}
+
+// Naming the epic requests no spec, even one that shares the epic's name.
+func TestRenderPretty_EpicNamedRequestsNoSpec(t *testing.T) {
+	r := Report{
+		Requested: "E",
+		Epic:      &EpicStatus{Name: "E"},
+		Specs:     []SpecStatus{{Name: "E", State: StateSpecified}},
+	}
+	require.Equal(t, -1, requestedIndex(r))
+	r.Requested = "other"
+	r.Specs = append(r.Specs, SpecStatus{Name: "other", State: StateSpecified})
+	require.Equal(t, 1, requestedIndex(r))
+}
+
+// With no spec requested, every spec being implemented is expanded to its
+// milestones and tasks: one in progress by its task counts, and one whose
+// implement workflow has started but completed nothing yet. Implemented
+// and unplanned specs stay on one line.
+func TestRenderPretty_NoRequestExpandsSpecsBeingImplemented(t *testing.T) {
+	e := newEnv(t)
+	e.standardEpic()
+	e.plan("C", "final", false, false)
+	e.opts.Lane = lanes(map[string]*workflow.State{
+		"implement-C": {Kind: "implement", CurrentStep: "analyze", Data: map[string]any{"name": "C", "orchestrated": true}},
+	})
+	e.opts.LaneNames = func(kind string) []string {
+		if kind == "implement" {
+			return []string{"C"}
+		}
+		return nil
+	}
+
+	r, err := BuildCurrent(e.opts)
+	require.NoError(t, err)
+	require.Empty(t, r.Requested)
+
+	var buf bytes.Buffer
+	require.NoError(t, RenderPretty(&buf, r))
+	out := buf.String()
+	require.Contains(t, out, "  ✓ A   implemented   ━━━━━━━━━━   2/2 tasks\n  ◐ B", "an implemented spec is not expanded")
+	require.Contains(t, out, "  ◐ B   in progress   ━━━───────   1/3 tasks\n      depends on: A\n      Milestone 1  1/3\n        [x] Task 1", "a spec in progress is expanded")
+	require.Contains(t, out, "  ○ C   planned       ──────────   0/2 tasks\n      depends on: B\n      Milestone 1  0/2\n        [ ] Task 1", "a spec whose implement workflow has started is expanded")
+
+	named, err := Build(e.opts, "E")
+	require.NoError(t, err)
+	buf.Reset()
+	require.NoError(t, RenderPretty(&buf, named))
+	require.Contains(t, buf.String(), "  ◐ B   in progress   ━━━───────   1/3 tasks\n      depends on: A\n      Milestone 1  1/3\n", "naming the epic expands the specs in progress")
 }
 
 func TestRenderPretty_StandaloneAndWorkflow(t *testing.T) {
@@ -843,8 +914,8 @@ func TestRenderPretty_StandaloneAndWorkflow(t *testing.T) {
 		"workflow in progress",
 		"  ● implement  S  at step verify",
 		"",
-		"✓ S   implemented   1/1 tasks   ← requested",
-		"    Milestone 1",
+		"✓ S   implemented   ━━━━━━━━━━   1/1 tasks",
+		"    Milestone 1  1/1",
 		"      [x] Task 1   spektacular   agent",
 		"",
 	}, "\n"), buf.String())
@@ -1007,4 +1078,50 @@ func TestBuild_StandaloneWorkflowBlockOmitsOrchestrated(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &got))
 	require.Equal(t, "milestones", got.Workflow["current_step"])
 	require.NotContains(t, got.Workflow, "orchestrated")
+}
+
+// Given a width, long dependency lists and a human task's reason wrap to
+// it, continuing under their text, and titles too wide for the columns are
+// cut to fit. Without one, every line is left whole.
+func TestRenderPretty_Width(t *testing.T) {
+	task := func(id, title string, done bool, exec, reason string, deps ...string) TaskStatus {
+		return TaskStatus{ExportTask: plantask.ExportTask{ID: id, Title: title, Milestone: 1, Repo: plantask.ExportRepo{Name: "repo"},
+			DependsOn: deps, Execution: plantask.Execution{Type: exec, Reason: reason}, Completed: done}}
+	}
+	r := Report{Requested: "S", Specs: []SpecStatus{{Name: "S", State: StateInProgress, Plan: &PlanStatus{
+		Progress: &PlanProgress{1, 3},
+		Tasks: []TaskStatus{
+			task("a", "Environment overrides use the prefix", true, "agent", ""),
+			task("b", "Release with the language surface changes", false, "human", "publishing a release tag is an action outside the code", "a"),
+			task("c", "Document the changed surface", false, "agent", "", "a", "b"),
+		}}}}}
+
+	var buf bytes.Buffer
+	require.NoError(t, RenderPrettyWith(&buf, r, PrettyOptions{Width: 60}))
+	require.Equal(t, strings.Join([]string{
+		"◐ S   in progress   ━━━───────   1/3 tasks",
+		"    Milestone 1  1/3",
+		"      [x] Environment overrides use the pref…   repo   agent",
+		"      [ ] Release with the language surface…    repo   human",
+		"          reason: publishing a release tag is an action",
+		"                  outside the code",
+		"          depends on: Environment overrides use the prefix",
+		"      [ ] Document the changed surface          repo   agent",
+		"          depends on: Environment overrides use the prefix,",
+		"                      Release with the language surface",
+		"                      changes",
+		"",
+	}, "\n"), buf.String())
+	for _, line := range strings.Split(buf.String(), "\n") {
+		require.LessOrEqual(t, lipgloss.Width(line), 60, line)
+	}
+
+	buf.Reset()
+	require.NoError(t, RenderPretty(&buf, r))
+	require.Contains(t, buf.String(), "      [ ] Release with the language surface changes   repo   human\n          reason: publishing a release tag is an action outside the code\n")
+
+	require.Equal(t, []string{"one two three", "four five"}, wrap("one  two three four five", 16))
+	require.Equal(t, []string{"a-word-longer-than-the-width", "is"}, wrap("a-word-longer-than-the-width is", 16), "a long word is a line of its own")
+	require.Equal(t, []string{"left whole below the narrowest width"}, wrap("left whole below the narrowest width", 15))
+	require.Equal(t, []string{""}, wrap("", 40))
 }
