@@ -93,11 +93,19 @@ func Execute() {
 // session log, for reconstructing a session after the fact. This is
 // strictly additive: with the option off (the default), runRoot's behavior
 // is byte-for-byte identical to what it is without any of this.
+//
+// SPEKTACULAR_SESSION_LOG=off leaves one command out of the session log,
+// for a caller that polls, such as an editor or agent-host mod refreshing
+// status every few seconds, whose calls would otherwise bury the session.
+// sessionLogEnv names the variable that, set to "off", keeps a command out
+// of the debug session log.
+const sessionLogEnv = "SPEKTACULAR_SESSION_LOG"
+
 func runRoot() int {
 	// The debug probe must tolerate running outside a project — the gate
 	// belongs to the command handlers, not here.
 	cfg, cfgErr := loadConfigLenient()
-	debugEnabled := cfgErr == nil && cfg.Debug.Enabled
+	debugEnabled := cfgErr == nil && cfg.Debug.Enabled && os.Getenv(sessionLogEnv) != "off"
 
 	var argv []string
 	var start time.Time
@@ -114,6 +122,7 @@ func runRoot() int {
 		orig = rootCmd.OutOrStdout()
 		buf = &bytes.Buffer{}
 		rootCmd.SetOut(io.MultiWriter(orig, buf))
+		terminalOut = orig
 	}
 
 	executedCmd, err := rootCmd.ExecuteC()
@@ -150,6 +159,7 @@ func runRoot() int {
 			})
 		}
 		rootCmd.SetOut(orig)
+		terminalOut = nil
 	}
 
 	return exitCode
@@ -246,12 +256,28 @@ func snapshotStatePath(argv []string) string {
 		if input.Orchestrated {
 			return lane
 		}
+		// An implement run started with worktrees on keeps a lane too.
+		if kind == "implement" && !dryRunArg(argv) {
+			if cfg, err := loadConfig(); err == nil && cfg.Implement.Worktrees {
+				return lane
+			}
+		}
 	case "goto":
 		if _, err := os.Stat(lane); err == nil {
 			return lane
 		}
 	}
 	return shared
+}
+
+// dryRunArg reports whether argv asks for a dry run.
+func dryRunArg(argv []string) bool {
+	for _, a := range argv {
+		if a == "--dry-run" || a == "-n" || a == "--dry-run=true" {
+			return true
+		}
+	}
+	return false
 }
 
 // readStateSnapshot reads the workflow state file at path and returns the

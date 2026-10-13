@@ -31,14 +31,15 @@ Where a piece of work stands can be inspected without reading Spek's state files
 ```bash
 spektacular status <name>                 # readable tree (--format pretty, the default)
 spektacular status <name> --format json   # the same report as structured data
-spektacular status                        # the workflow in progress, if any
+spektacular status                        # every workflow in progress, if any
+spektacular status [name] --watch         # keep the readable tree on screen, scrollable, refreshed every --interval (2s)
 ```
 
 `<name>` is a bare artifact name with no extension (`20260922132517-a3f9c0de-git-commit`, not `20260922132517-a3f9c0de-git-commit.md`), the same name `state.json` records in `data.name`, and may be an epic, a spec or a plan. A spec that belongs to an epic, or that spec's plan, reports the whole epic, with the spec asked for named in `requested`; a standalone spec reports on its own. The JSON report always has the same shape, so callers never branch on kind: `epic` (null for a standalone spec, otherwise its document status and a roll-up of specs implemented and tasks complete), and `specs`, one entry per spec carrying its derived `state` (`missing`, `stale`, `specified`, `planned`, `in_progress` or `implemented`), `document_status`, `current_step`, `depends_on`, `ready`, `blocked_by` and its `plan`. A plan reports its `document_status`, `current_step`, task `progress`, and every task under `specs[].plan.tasks` with its `id`, `title`, `milestone`, `repo`, `depends_on`, `execution`, `completed` and `acceptance_criteria` counts; a plan without task structure omits `progress` and `tasks`.
 
-`current_step` is the live workflow step when that artifact's workflow is in progress, `finished` for a closed document, `stale` for a stale plan, and empty otherwise. The report carries a `workflow` block (`kind`, `name`, `current_step`, `completed_steps`, `updated_at`) when the workflow in progress belongs to one of the reported specs or plans, and `null` otherwise. With no name, `status` reports the workflow in progress the same way, or `{"workflow": null}` when nothing is in progress. An unknown name is refused with `artifact_not_found`, and an unsupported `--format` with `status_format_unsupported`; failures are always JSON, whatever format was asked for. Frontmatter dates are emitted as RFC3339 midnight UTC timestamps. `spec file list` and `plan file list` carry `modified_at` per entry, so polling many artifacts is one list call.
+`current_step` is the live workflow step when that artifact's workflow is in progress, `finished` for a closed document, `stale` for a stale plan, and empty otherwise. The report carries a `workflow` block (`kind`, `name`, `current_step`, `completed_steps`, `updated_at`) when the workflow in progress belongs to one of the reported specs or plans, and `null` otherwise. With no name, `status` reports every workflow in progress: the shared one, and each run kept in its own lane under `.spektacular/workflows/` (an implement run in its own worktrees, or a run an epic's orchestrator started). `workflows` lists them, the shared one first and then the lanes, most recently updated first; `workflow` is the first, carrying `orchestrated: true` when an orchestrator started it, and the report shows its epic or spec in full, with the same `run` view as naming it. When an orchestrator started that first run, the report is its epic's and no single spec is `requested`. In the readable tree, the requested spec is expanded to its milestones and tasks; with no spec requested, every spec being implemented is expanded instead. With nothing in progress it is `{"workflow": null}`. The readable tree is coloured on a terminal and plain text when piped or when `NO_COLOR` is set. Long dependency lists wrap to the terminal, and task titles too wide for their columns are cut to fit. `--watch` keeps it on screen, redrawn in place every `--interval` (default `2s`, at least `200ms`) until `q`, Esc or Ctrl+C; a tree taller than the screen scrolls with the arrow keys, `j`/`k`, PgUp/PgDn, `g`/`G` and the mouse wheel, and keeps its place across a refresh; it is refused with `--format json` (`status_watch_format_unsupported`), and a shorter interval is refused with `status_interval_invalid`. An unknown name is refused with `artifact_not_found`, and an unsupported `--format` with `status_format_unsupported`; failures are always JSON, whatever format was asked for. Frontmatter dates are emitted as RFC3339 midnight UTC timestamps. `spec file list` and `plan file list` carry `modified_at` per entry, so polling many artifacts is one list call.
 
-When `plan.strict_spec_changes` is true, `status` reports a plan's `document_status: "stale"` and `current_step: "stale"`, and its spec's state as `stale`, once the linked spek is modified after a final plan; `implement new` and subsequent implement steps refuse that plan until it is replanned and re-approved. With the default non-strict setting, a later spek edit does not invalidate an existing plan.
+When `plan.strict_spec_changes` is true, `status` reports a plan's `document_status: "stale"` and `current_step: "stale"`, and its spec's state as `stale`, once the linked spek is modified after a final plan; `implement new` and subsequent implement steps refuse that plan until it is replanned and re-approved. With the default non-strict setting, a later spek edit does not invalidate an existing plan. A spek change recorded with `spektacular spec amend` during an implement run does not make the plan stale in either mode; any other edit to the spek's body still does under the strict setting.
 
 **Epics.** When a piece of work is split into an epic, ask your agent to *plan this epic*, review the plans, then *implement this epic*. Independent specs are worked on in parallel, each spec is built in its own worktree and merged before the specs that depend on it, and repeating either request picks up where it stopped. Naming an epic in `status` adds a `run` view that says, for planning and for implementing, what each spec still needs and what blocks the epic. See [Epics](https://spektacular.dev/epics/).
 
@@ -260,7 +261,7 @@ command: spektacular
 agent: claude
 auto_commit: "off"                  # off | workflow | full: automatic git commits (local only)
 debug:
-  enabled: false
+  enabled: false                    # true records every command and response to a session log; SPEKTACULAR_SESSION_LOG=off leaves one call out
 spec:
   provider: file
   id_method: timestamp              # timestamp + random suffix; counter is legacy and branch-local
@@ -268,7 +269,7 @@ spec:
     directory: specs                # relative to the folder holding config.yaml
 plan:
   provider: file
-  strict_spec_changes: false        # true marks final plans stale after later spec edits
+  strict_spec_changes: false        # true marks final plans stale after later spec edits (recorded amendments excepted)
   config:
     directory: plans                # relative to the folder holding config.yaml
 changelog:
