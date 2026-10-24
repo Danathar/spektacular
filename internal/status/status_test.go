@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/hivecommons/spektacular/internal/config"
 	"github.com/hivecommons/spektacular/internal/epic"
 	"github.com/hivecommons/spektacular/internal/metadata"
@@ -242,7 +243,7 @@ func TestBuild_EpicReport(t *testing.T) {
 	require.Equal(t, "draft", r.Epic.DocumentStatus)
 	require.Equal(t, "2026-09-28T00:00:00Z", r.Epic.CreatedAt)
 	require.False(t, r.Epic.Done)
-	require.Equal(t, EpicProgress{SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
+	require.Equal(t, EpicProgress{SpecsPlanned: 2, SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
 
 	names := []string{}
 	for _, s := range r.Specs {
@@ -485,6 +486,91 @@ func TestBuild_StalePlan(t *testing.T) {
 	require.Equal(t, "stale", s.Plan.CurrentStep)
 }
 
+// amendedSpecBody is the spec body the amendment cases record and edit.
+const amendedSpecBody = "\n# Spec\n\n## Success Metrics\n\n- [ ] metric one\n"
+
+// amendedSpec renders a final spec with extraFM lines in its frontmatter,
+// one amendment per hash, and body.
+func amendedSpec(extraFM string, hashes []string, body string) string {
+	var b strings.Builder
+	b.WriteString("---\ncreated_date: \"2026-09-28\"\ndocument_status: final\n")
+	b.WriteString(extraFM)
+	if len(hashes) > 0 {
+		b.WriteString("amendments:\n")
+		for _, h := range hashes {
+			fmt.Fprintf(&b, "    - at: \"2026-09-30T10:00:00Z\"\n      sections: [Success Metrics]\n      hash: %s\n", h)
+		}
+	}
+	b.WriteString("---\n")
+	b.WriteString(body)
+	return b.String()
+}
+
+// bodyHashOf returns the BodyHash of the body Split finds in doc; it seeds
+// fixtures so a recorded amendment matches exactly what is on disk.
+func bodyHashOf(t *testing.T, doc string) string {
+	t.Helper()
+	_, body, err := metadata.Split([]byte(doc))
+	require.NoError(t, err)
+	return metadata.BodyHash(body)
+}
+
+// TestPlanIsStale_RecordedAmendments checks that a final plan whose spec was
+// changed only through recorded amendments is not stale, while any unrecorded
+// body edit, a spec with no amendments, or an unreadable spec still falls
+// back to the modification-time comparison.
+func TestPlanIsStale_RecordedAmendments(t *testing.T) {
+	match := bodyHashOf(t, amendedSpec("", nil, amendedSpecBody))
+	edited := amendedSpecBody + "- [ ] metric two\n"
+	ticked := strings.Replace(amendedSpecBody, "- [ ] metric one", "- [x] metric one", 1)
+
+	for _, tc := range []struct {
+		name      string
+		spec      string
+		planState string
+		want      bool
+	}{
+		{"no amendments", amendedSpec("", nil, amendedSpecBody), "final", true},
+		{"last amendment matches the body", amendedSpec("", []string{match}, amendedSpecBody), "final", false},
+		{"body edited after the amendment", amendedSpec("", []string{match}, edited), "final", true},
+		{"checkbox ticked after the amendment", amendedSpec("", []string{match}, ticked), "final", false},
+		{"frontmatter changed after the amendment", amendedSpec("epic: E\n", []string{match}, amendedSpecBody), "final", false},
+		{"only an earlier amendment matches", amendedSpec("", []string{match, bodyHashOf(t, amendedSpec("", nil, edited))}, amendedSpecBody), "final", true},
+		{"malformed frontmatter", "---\ndocument_status: [final\namendments:\n    - hash: " + match + "\n---\n" + amendedSpecBody, "final", true},
+		{"non-final plan", amendedSpec("", nil, amendedSpecBody), "draft", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.write("specs/S.md", tc.spec)
+			e.plan("S", tc.planState, true)
+			old := time.Now().Add(-time.Hour)
+			e.touch("plans/S/plan.md", old)
+			e.touch("specs/S.md", old.Add(time.Minute))
+
+			raw, err := os.ReadFile(filepath.Join(e.root, "plans/S/plan.md"))
+			require.NoError(t, err)
+			fm, _, err := metadata.Split(raw)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, PlanIsStale(e.opts.Config, e.opts.Store, "S", fm))
+		})
+	}
+
+	t.Run("build reports a matching amendment as implemented", func(t *testing.T) {
+		e := newEnv(t)
+		e.write("specs/S.md", amendedSpec("", []string{match}, amendedSpecBody))
+		e.plan("S", "final", true)
+		old := time.Now().Add(-time.Hour)
+		e.touch("plans/S/plan.md", old)
+		e.touch("specs/S.md", old.Add(time.Minute))
+		e.opts.Config.Plan.StrictSpecChanges = true
+
+		r, err := Build(e.opts, "S")
+		require.NoError(t, err)
+		require.Equal(t, StateImplemented, r.Specs[0].State)
+		require.Equal(t, "final", r.Specs[0].Plan.DocumentStatus)
+	})
+}
+
 func TestBuild_WorkflowBlock(t *testing.T) {
 	e := newEnv(t)
 	e.standardEpic()
@@ -548,7 +634,83 @@ func TestBuildCurrent(t *testing.T) {
 		require.NoError(t, err)
 		raw, err := json.Marshal(r)
 		require.NoError(t, err)
-		require.JSONEq(t, `{"workflow": {"kind": "spec", "name": "unwritten", "current_step": "overview", "completed_steps": [], "updated_at": ""}}`, string(raw))
+		require.JSONEq(t, `{"workflow": {"kind": "spec", "name": "unwritten", "current_step": "overview", "completed_steps": [], "updated_at": ""}, "workflows": [{"kind": "spec", "name": "unwritten", "current_step": "overview", "completed_steps": [], "updated_at": ""}]}`, string(raw))
+	})
+}
+
+// With no name, a workflow kept in its own lane is reported even though the
+// shared state holds nothing in progress: an implement run with worktrees,
+// or an epic's orchestrated runs, never touch the shared state.
+func TestBuildCurrent_Lanes(t *testing.T) {
+	older := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	laneSet := map[string]*workflow.State{
+		"plan-C":      {Kind: "plan", CurrentStep: "overview", UpdatedAt: older, Data: map[string]any{"name": "C", "orchestrated": true}},
+		"implement-B": {Kind: "implement", CurrentStep: "analyze", UpdatedAt: newer, Data: map[string]any{"name": "B"}},
+		"implement-A": {Kind: "implement", CurrentStep: "finished", UpdatedAt: newer, Data: map[string]any{"name": "A"}},
+	}
+	laneNames := func(kind string) []string {
+		var names []string
+		for _, n := range []string{"A", "B", "C"} {
+			if laneSet[kind+"-"+n] != nil {
+				names = append(names, n)
+			}
+		}
+		return names
+	}
+
+	t.Run("a lane alone is the workflow in progress", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+		e.opts.State = &workflow.State{Kind: "plan", CurrentStep: "finished", Data: map[string]any{"name": "A"}}
+		e.opts.Lane = lanes(laneSet)
+		e.opts.LaneNames = laneNames
+
+		r, err := BuildCurrent(e.opts)
+		require.NoError(t, err)
+		require.Len(t, r.Workflows, 2, "a finished lane is not in progress")
+		require.Equal(t, "B", r.Workflows[0].Name, "the most recently updated lane comes first")
+		require.False(t, r.Workflows[0].Orchestrated, "an interactive run in its own lane is not orchestrated")
+		require.Equal(t, "C", r.Workflows[1].Name)
+		require.True(t, r.Workflows[1].Orchestrated)
+		require.Equal(t, &r.Workflows[0], r.Workflow)
+		require.Equal(t, "E", r.Epic.Name, "the running spec's epic is reported")
+		require.Equal(t, "B", r.Requested)
+	})
+
+	t.Run("an orchestrated run reports its epic with no spec requested", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+		e.opts.State = nil
+		e.opts.Lane = lanes(map[string]*workflow.State{
+			"plan-C": laneSet["plan-C"],
+		})
+		e.opts.LaneNames = func(kind string) []string {
+			if kind == "plan" {
+				return []string{"C"}
+			}
+			return nil
+		}
+
+		r, err := BuildCurrent(e.opts)
+		require.NoError(t, err)
+		require.True(t, r.Workflow.Orchestrated)
+		require.Equal(t, "E", r.Epic.Name)
+		require.Empty(t, r.Requested, "the epic is the operation, not the one spec")
+	})
+
+	t.Run("the shared workflow comes before every lane", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+		e.opts.State = &workflow.State{Kind: "spec", CurrentStep: "requirements", Data: map[string]any{"name": "D"}}
+		e.opts.Lane = lanes(laneSet)
+		e.opts.LaneNames = laneNames
+
+		r, err := BuildCurrent(e.opts)
+		require.NoError(t, err)
+		require.Len(t, r.Workflows, 3)
+		require.Equal(t, "spec", r.Workflow.Kind)
+		require.Equal(t, "D", r.Workflow.Name)
 	})
 }
 
@@ -588,6 +750,78 @@ func TestDependenciesOf(t *testing.T) {
 	require.Equal(t, SpecDependencies{}, deps, "a standalone spec has no dependencies")
 }
 
+// An implemented dependency whose worktrees are not merged yet is unmet: it
+// is worded "implemented but not yet merged", and its dependent is not ready.
+// Its own state stays implemented, and the epic counts it as implemented.
+func TestDependenciesOf_UnmergedDependencyIsUnmet(t *testing.T) {
+	e := newEnv(t)
+	e.standardEpic()
+	e.opts.Unmerged = func(spec string) bool { return spec == "A" }
+
+	deps, err := DependenciesOf(e.opts, "B")
+	require.NoError(t, err)
+	require.Equal(t, []Dependency{{Name: "A", State: StateImplemented, Progress: TaskCounts{2, 2}, Description: "implemented but not yet merged", Ready: true, Unmerged: true}}, deps.Dependencies)
+	require.Equal(t, deps.Dependencies, deps.Unmet())
+
+	r, err := Build(e.opts, "E")
+	require.NoError(t, err)
+	a := specByName(t, r, "A")
+	require.Equal(t, StateImplemented, a.State)
+	b := specByName(t, r, "B")
+	require.False(t, b.Ready)
+	require.Equal(t, []string{"A"}, b.BlockedBy)
+	require.Equal(t, EpicProgress{SpecsPlanned: 2, SpecsImplemented: 1, SpecsTotal: 4, TasksCompleted: 3, TasksTotal: 5}, r.Epic.Progress)
+}
+
+// The hook only matters for an implemented dependency, and a hook reporting
+// nothing unmerged leaves every implemented dependency met.
+func TestDependenciesOf_UnmergedHook(t *testing.T) {
+	t.Run("hook reports nothing unmerged", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+		e.opts.Unmerged = func(string) bool { return false }
+
+		deps, err := DependenciesOf(e.opts, "B")
+		require.NoError(t, err)
+		require.Equal(t, []Dependency{{Name: "A", State: StateImplemented, Progress: TaskCounts{2, 2}, Description: "implemented", Ready: true}}, deps.Dependencies)
+		require.Empty(t, deps.Unmet())
+
+		r, err := Build(e.opts, "E")
+		require.NoError(t, err)
+		b := specByName(t, r, "B")
+		require.True(t, b.Ready)
+		require.Equal(t, []string{}, b.BlockedBy)
+	})
+
+	t.Run("nil hook", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+
+		deps, err := DependenciesOf(e.opts, "B")
+		require.NoError(t, err)
+		require.Equal(t, []Dependency{{Name: "A", State: StateImplemented, Progress: TaskCounts{2, 2}, Description: "implemented", Ready: true}}, deps.Dependencies)
+		require.Empty(t, deps.Unmet())
+	})
+
+	t.Run("a dependency that is not implemented is never unmerged", func(t *testing.T) {
+		e := newEnv(t)
+		e.standardEpic()
+		e.opts.Unmerged = func(string) bool { return true }
+
+		deps, err := DependenciesOf(e.opts, "C")
+		require.NoError(t, err)
+		// B itself is not ready, because the hook reports its dependency A unmerged.
+		require.Equal(t, []Dependency{{Name: "B", State: StateInProgress, Progress: TaskCounts{1, 3}, Description: "in progress (1/3 tasks complete)", Ready: false}}, deps.Dependencies)
+	})
+}
+
+func TestDescribeDependency(t *testing.T) {
+	require.Equal(t, "implemented but not yet merged", DescribeDependency(StateImplemented, TaskCounts{5, 5}, true))
+	require.Equal(t, "implemented", DescribeDependency(StateImplemented, TaskCounts{5, 5}, false))
+	require.Equal(t, "in progress (2/5 tasks complete)", DescribeDependency(StateInProgress, TaskCounts{2, 5}, true))
+	require.Equal(t, "unplanned", DescribeDependency(StateSpecified, TaskCounts{}, true))
+}
+
 func TestRenderPretty_Epic(t *testing.T) {
 	e := newEnv(t)
 	e.standardEpic()
@@ -597,23 +831,73 @@ func TestRenderPretty_Epic(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, RenderPretty(&buf, r))
 	want := strings.Join([]string{
-		"epic E  (draft)  1/4 specs implemented, 3/5 tasks",
+		"epic E  (draft)",
+		"  ━━━━━━━━━━━━────────  3/5 tasks · 2/4 specs planned · 1/4 implemented",
 		"",
-		"  A   implemented   2/2 tasks",
-		"  B   in progress   1/3 tasks   ← requested",
+		"  ✓ A   implemented   ━━━━━━━━━━   2/2 tasks",
+		"  ◐ B   in progress   ━━━───────   1/3 tasks",
 		"      depends on: A",
-		"      Milestone 1",
+		"      Milestone 1  1/3",
 		"        [x] Task 1   spektacular   agent",
 		"        [ ] Task 2   spektacular   agent",
 		"            depends on: Task 1",
 		"        [ ] Task 3   spektacular   agent",
 		"            depends on: Task 2",
-		"  C   specified     no plan",
+		"  · C   specified                  no plan",
 		"      depends on: B",
-		"  D   missing       no plan",
+		"  ✗ D   missing                    no plan",
 		"",
 	}, "\n")
 	require.Equal(t, want, buf.String())
+}
+
+// Naming the epic requests no spec, even one that shares the epic's name.
+func TestRenderPretty_EpicNamedRequestsNoSpec(t *testing.T) {
+	r := Report{
+		Requested: "E",
+		Epic:      &EpicStatus{Name: "E"},
+		Specs:     []SpecStatus{{Name: "E", State: StateSpecified}},
+	}
+	require.Equal(t, -1, requestedIndex(r))
+	r.Requested = "other"
+	r.Specs = append(r.Specs, SpecStatus{Name: "other", State: StateSpecified})
+	require.Equal(t, 1, requestedIndex(r))
+}
+
+// With no spec requested, every spec being implemented is expanded to its
+// milestones and tasks: one in progress by its task counts, and one whose
+// implement workflow has started but completed nothing yet. Implemented
+// and unplanned specs stay on one line.
+func TestRenderPretty_NoRequestExpandsSpecsBeingImplemented(t *testing.T) {
+	e := newEnv(t)
+	e.standardEpic()
+	e.plan("C", "final", false, false)
+	e.opts.Lane = lanes(map[string]*workflow.State{
+		"implement-C": {Kind: "implement", CurrentStep: "analyze", Data: map[string]any{"name": "C", "orchestrated": true}},
+	})
+	e.opts.LaneNames = func(kind string) []string {
+		if kind == "implement" {
+			return []string{"C"}
+		}
+		return nil
+	}
+
+	r, err := BuildCurrent(e.opts)
+	require.NoError(t, err)
+	require.Empty(t, r.Requested)
+
+	var buf bytes.Buffer
+	require.NoError(t, RenderPretty(&buf, r))
+	out := buf.String()
+	require.Contains(t, out, "  ✓ A   implemented   ━━━━━━━━━━   2/2 tasks\n  ◐ B", "an implemented spec is not expanded")
+	require.Contains(t, out, "  ◐ B   in progress   ━━━───────   1/3 tasks\n      depends on: A\n      Milestone 1  1/3\n        [x] Task 1", "a spec in progress is expanded")
+	require.Contains(t, out, "  ○ C   planned       ──────────   0/2 tasks\n      depends on: B\n      Milestone 1  0/2\n        [ ] Task 1", "a spec whose implement workflow has started is expanded")
+
+	named, err := Build(e.opts, "E")
+	require.NoError(t, err)
+	buf.Reset()
+	require.NoError(t, RenderPretty(&buf, named))
+	require.Contains(t, buf.String(), "  ◐ B   in progress   ━━━───────   1/3 tasks\n      depends on: A\n      Milestone 1  1/3\n", "naming the epic expands the specs in progress")
 }
 
 func TestRenderPretty_StandaloneAndWorkflow(t *testing.T) {
@@ -627,10 +911,11 @@ func TestRenderPretty_StandaloneAndWorkflow(t *testing.T) {
 	var buf bytes.Buffer
 	require.NoError(t, RenderPretty(&buf, r))
 	require.Equal(t, strings.Join([]string{
-		"workflow in progress: implement S, at step verify",
+		"workflow in progress",
+		"  ● implement  S  at step verify",
 		"",
-		"S   implemented   1/1 tasks   ← requested",
-		"    Milestone 1",
+		"✓ S   implemented   ━━━━━━━━━━   1/1 tasks",
+		"    Milestone 1  1/1",
 		"      [x] Task 1   spektacular   agent",
 		"",
 	}, "\n"), buf.String())
@@ -638,6 +923,29 @@ func TestRenderPretty_StandaloneAndWorkflow(t *testing.T) {
 	buf.Reset()
 	require.NoError(t, RenderPretty(&buf, Report{}))
 	require.Equal(t, "no workflow in progress\n", buf.String())
+
+	buf.Reset()
+	require.NoError(t, RenderPretty(&buf, Report{Workflows: []WorkflowInfo{
+		{Kind: "implement", Name: "S", CurrentStep: "verify"},
+		{Kind: "plan", Name: "other", CurrentStep: "overview", Orchestrated: true},
+	}}))
+	require.Equal(t, strings.Join([]string{
+		"2 workflows in progress",
+		"  ● implement  S      at step verify",
+		"  ● plan       other  at step overview  (orchestrated)",
+		"",
+	}, "\n"), buf.String())
+}
+
+// A writer that is not a terminal gets plain text: no escape codes.
+func TestRenderPretty_PlainWhenNotATerminal(t *testing.T) {
+	e := newEnv(t)
+	e.standardEpic()
+	r, err := Build(e.opts, "B")
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	require.NoError(t, RenderPretty(&buf, r))
+	require.NotContains(t, buf.String(), "\x1b[")
 }
 
 // lanes is a fake Options.Lane: the lane for kind+name, or nil.
@@ -770,4 +1078,50 @@ func TestBuild_StandaloneWorkflowBlockOmitsOrchestrated(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &got))
 	require.Equal(t, "milestones", got.Workflow["current_step"])
 	require.NotContains(t, got.Workflow, "orchestrated")
+}
+
+// Given a width, long dependency lists and a human task's reason wrap to
+// it, continuing under their text, and titles too wide for the columns are
+// cut to fit. Without one, every line is left whole.
+func TestRenderPretty_Width(t *testing.T) {
+	task := func(id, title string, done bool, exec, reason string, deps ...string) TaskStatus {
+		return TaskStatus{ExportTask: plantask.ExportTask{ID: id, Title: title, Milestone: 1, Repo: plantask.ExportRepo{Name: "repo"},
+			DependsOn: deps, Execution: plantask.Execution{Type: exec, Reason: reason}, Completed: done}}
+	}
+	r := Report{Requested: "S", Specs: []SpecStatus{{Name: "S", State: StateInProgress, Plan: &PlanStatus{
+		Progress: &PlanProgress{1, 3},
+		Tasks: []TaskStatus{
+			task("a", "Environment overrides use the prefix", true, "agent", ""),
+			task("b", "Release with the language surface changes", false, "human", "publishing a release tag is an action outside the code", "a"),
+			task("c", "Document the changed surface", false, "agent", "", "a", "b"),
+		}}}}}
+
+	var buf bytes.Buffer
+	require.NoError(t, RenderPrettyWith(&buf, r, PrettyOptions{Width: 60}))
+	require.Equal(t, strings.Join([]string{
+		"◐ S   in progress   ━━━───────   1/3 tasks",
+		"    Milestone 1  1/3",
+		"      [x] Environment overrides use the pref…   repo   agent",
+		"      [ ] Release with the language surface…    repo   human",
+		"          reason: publishing a release tag is an action",
+		"                  outside the code",
+		"          depends on: Environment overrides use the prefix",
+		"      [ ] Document the changed surface          repo   agent",
+		"          depends on: Environment overrides use the prefix,",
+		"                      Release with the language surface",
+		"                      changes",
+		"",
+	}, "\n"), buf.String())
+	for _, line := range strings.Split(buf.String(), "\n") {
+		require.LessOrEqual(t, lipgloss.Width(line), 60, line)
+	}
+
+	buf.Reset()
+	require.NoError(t, RenderPretty(&buf, r))
+	require.Contains(t, buf.String(), "      [ ] Release with the language surface changes   repo   human\n          reason: publishing a release tag is an action outside the code\n")
+
+	require.Equal(t, []string{"one two three", "four five"}, wrap("one  two three four five", 16))
+	require.Equal(t, []string{"a-word-longer-than-the-width", "is"}, wrap("a-word-longer-than-the-width is", 16), "a long word is a line of its own")
+	require.Equal(t, []string{"left whole below the narrowest width"}, wrap("left whole below the narrowest width", 15))
+	require.Equal(t, []string{""}, wrap("", 40))
 }
