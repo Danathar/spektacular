@@ -29,6 +29,12 @@ type Git interface {
 	// Dirty reports whether the work tree at top has uncommitted changes,
 	// untracked files included.
 	Dirty(top string) (bool, error)
+	// CodeDirty reports whether the work tree at top has uncommitted
+	// changes outside every .spektacular directory: the code a branch cut
+	// from its last commit would be missing. Spektacular's own files —
+	// specs, plans, changelogs, workflow state and notes — never travel with
+	// code, so they never count.
+	CodeDirty(top string) (bool, error)
 	// CommitAll stages everything in the work tree at top and commits it
 	// with message. Hooks, identity and signing are the user's own: nothing
 	// is overridden and nothing is bypassed.
@@ -71,6 +77,18 @@ func (execGit) Dirty(top string) (bool, error) {
 	return out != "", nil
 }
 
+func (execGit) CodeDirty(top string) (bool, error) {
+	out, err := gitexec.Run(top, nil, "status", "--porcelain", "--", ".", SpektacularExcludePathspec)
+	if err != nil {
+		return false, err
+	}
+	return out != "", nil
+}
+
+// SpektacularExcludePathspec leaves out every path under a .spektacular
+// directory at any depth.
+const SpektacularExcludePathspec = ":(exclude,glob)**/.spektacular/**"
+
 func (execGit) CommitAll(top, message string) error {
 	if _, err := gitexec.Run(top, nil, "add", "-A"); err != nil {
 		return err
@@ -84,23 +102,22 @@ func (execGit) CommitAll(top, message string) error {
 }
 
 func (execGit) CommitPaths(top string, paths []string, message string) error {
-	// Only paths holding something git can commit are kept, because a path
-	// with nothing under it makes git refuse the whole pathspec: one that
-	// never existed, a scratch folder left empty once the staged commit
-	// message was removed, or a folder .gitignore covers entirely. ls-files
-	// finds what can be staged — tracked entries, deleted ones included, and
-	// untracked files that are not ignored. HEAD matters for a retry: a
-	// rejected first attempt has already staged a deletion, so the path is
-	// gone from disk and index alike, yet the deletion still has to be
-	// committed. git add refuses a path in neither the work tree nor the
-	// index, so such a path goes straight to the commit.
+	// A path git has no file for — a scratch folder the run never created,
+	// one left empty, or one git ignores — would make git refuse the whole
+	// pathspec, so only paths holding a file git can commit, or one in HEAD,
+	// are kept. HEAD matters for a retry: a rejected first attempt has
+	// already staged a deletion, so the path is gone from disk and index
+	// alike, yet the deletion still has to be committed.
+	// git add refuses a path with nothing in the work tree or the index, so
+	// only those are staged; a path left only in HEAD is a deletion already
+	// staged, and goes straight to the commit.
 	var keep, stage []string
 	for _, p := range paths {
-		stageable, err := gitexec.Run(top, nil, "ls-files", "--cached", "--others", "--exclude-standard", "--", p)
+		known, err := gitexec.Run(top, nil, "ls-files", "--cached", "--others", "--exclude-standard", "--", p)
 		if err != nil {
 			return err
 		}
-		if stageable != "" {
+		if known != "" {
 			keep, stage = append(keep, p), append(stage, p)
 			continue
 		}

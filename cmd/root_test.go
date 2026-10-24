@@ -123,6 +123,7 @@ func writeSpecFileFixture(t *testing.T) (dir string) {
 // Criterion 1: every command family reports both success and failure on
 // stdout, and stderr stays empty in both cases.
 func TestWrapper_SuccessAndFailureBothStreamOnStdoutOnly(t *testing.T) {
+	t.Chdir(t.TempDir())
 	t.Run("spec", func(t *testing.T) {
 		// Separate temp dirs per invocation: `spec new`'s resume check runs
 		// before its name validation, so a successful call followed by a
@@ -172,7 +173,7 @@ func TestWrapper_SuccessAndFailureBothStreamOnStdoutOnly(t *testing.T) {
 		dir := t.TempDir()
 		t.Chdir(dir)
 		dataDir := filepath.Join(dir, ".spektacular")
-		writeSpecCommandConfig(t, dir, "")
+		writeSpecCommandConfig(t, dir, implementSharedSlotConfig)
 		writeFixturePlan(t, dataDir, "fixture")
 
 		resetRootCmd(t)
@@ -280,6 +281,7 @@ func TestWrapper_SuccessAndFailureBothStreamOnStdoutOnly(t *testing.T) {
 // SuccessAndFailureBothStreamOnStdoutOnly), so only their failure paths are
 // asserted here.
 func TestWrapper_ErrorDiscriminantAndExitCode(t *testing.T) {
+	t.Chdir(t.TempDir())
 	assertSuccessEnvelope := func(t *testing.T, stdout string, code int) {
 		t.Helper()
 		require.Equal(t, 0, code)
@@ -334,7 +336,7 @@ func TestWrapper_ErrorDiscriminantAndExitCode(t *testing.T) {
 		dir := t.TempDir()
 		t.Chdir(dir)
 		dataDir := filepath.Join(dir, ".spektacular")
-		writeSpecCommandConfig(t, dir, "")
+		writeSpecCommandConfig(t, dir, implementSharedSlotConfig)
 		writeFixturePlan(t, dataDir, "fixture")
 
 		resetRootCmd(t)
@@ -522,6 +524,7 @@ func TestWrapper_FailureIsPrintedExactlyOnceWithNoCobraBoilerplate(t *testing.T)
 // mis-invocation seen in practice) or omits one entirely, and must get a
 // structured, retryable error rather than cobra's silent, exit-0 help dump.
 func TestUnknownSubcommand_ReturnsStructuredErrorNamingValidSubcommands(t *testing.T) {
+	t.Chdir(t.TempDir())
 	t.Run("unrecognized subcommand names the offending word and the group", func(t *testing.T) {
 		stdout, _, code := runRootCmd(t, "plan", "resume", "somename")
 		require.Equal(t, 1, code)
@@ -542,7 +545,7 @@ func TestUnknownSubcommand_ReturnsStructuredErrorNamingValidSubcommands(t *testi
 		require.NoError(t, json.Unmarshal([]byte(stdout), &er))
 		require.Equal(t, "unknown_subcommand", er.Code)
 		require.Equal(t, `no subcommand given for "spektacular spec"`, er.Message)
-		require.Equal(t, "run one of: file, goto, new, steps", er.NextAction)
+		require.Equal(t, "run one of: amend, file, goto, new, steps", er.NextAction)
 	})
 
 	t.Run("missing epic subcommand names the epic verbs", func(t *testing.T) {
@@ -572,6 +575,7 @@ func TestUnknownSubcommand_ReturnsStructuredErrorNamingValidSubcommands(t *testi
 // agent hit mid-session trying `plan goto <name> <step>` (positional-style,
 // no --data at all) before finding the correct flag shape.
 func TestGotoStepRequired_ReturnsStructuredErrorAcrossAllKinds(t *testing.T) {
+	t.Chdir(t.TempDir())
 	kinds := []struct {
 		kind      string
 		stepsHint string
@@ -670,6 +674,20 @@ func TestSessionLog_DisabledProducesNoRecordFile(t *testing.T) {
 
 		require.Empty(t, sessionLogFiles(t, dir), "session log must not be created when debug is explicitly off")
 	})
+}
+
+// SPEKTACULAR_SESSION_LOG=off keeps one command out of the session log even
+// with debug on, so a caller that polls status does not bury the session.
+func TestSessionLog_EnvOffLeavesACommandOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeSpecCommandConfig(t, dir, "debug:\n  enabled: true\n")
+	resetRootCmd(t)
+	t.Setenv(sessionLogEnv, "off")
+
+	stdout, _, code := runRootCmd(t, "spec", "new", "--data", `{"name":"billing"}`)
+	require.Equal(t, 0, code, stdout)
+	require.Empty(t, sessionLogFiles(t, dir))
 }
 
 // Phase 1.2, criterion 2: with debug on, a command that succeeds and a
